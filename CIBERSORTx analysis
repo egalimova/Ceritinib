@@ -1,0 +1,130 @@
+library(readr)
+library(tidyr)
+library(dplyr)
+library(stringr)
+
+result <- read_delim("~/Downloads/CIBERSORTx_Job82_Adjusted.txt")
+result_tidy <- pivot_longer(result, cols = 2:(ncol(result)-3), names_to = "celltype", values_to = "value")
+
+result_tidy <- result_tidy %>%
+  mutate(Mixture = recode(
+    Mixture,
+    "TMS25H_1_count"  = "TMS25H_1_Pt.92_control_1.tsv",
+    "TMS25H_2_count"  = "TMS25H_2_Pt.92_control_2.tsv",
+    "TMS25H_3_count"  = "TMS25H_3_Pt.92_gsk_1.tsv",
+    "TMS25H_4_count"  = "TMS25H_4_Pt.92_gsk_2.tsv",
+    "TMS25H_5_count"  = "TMS25H_5_Pt.162_control_1.tsv",
+    "TMS25H_6_count"  = "TMS25H_6_Pt.162_control_2.tsv",
+    "TMS25H_7_count"  = "TMS25H_7_Pt.162_gsk_1.tsv",
+    "TMS25H_8_count"  = "TMS25H_8_Pt.162_gsk_2.tsv",
+    "TMS25H_9_count"  = "TMS25H_9_Pt.146_control_1.tsv",
+    "TMS25H_10_count" = "TMS25H_10_Pt.146_control_2.tsv",
+    "TMS25H_11_count" = "TMS25H_11_Pt.146_gsk_1.tsv",
+    "TMS25H_12_count" = "TMS25H_12_Pt.146_gsk_2.tsv",
+    "TMS25H_13_count" = "TMS25H_13_gtc-047_control_1.tsv",
+    "TMS25H_14_count" = "TMS25H_14_gtc-047_control_2.tsv",
+    "TMS25H_15_count" = "TMS25H_15_gtc-047_gsk_1.tsv",
+    "TMS25H_16_count" = "TMS25H_16_gtc-047_gsk_2.tsv",
+    "TMS25H_17_count" = "TMS25H_17_gtc-770_control_1.tsv",
+    "TMS25H_18_count" = "TMS25H_18_gtc-770_gsk_1.tsv"
+  ))
+
+result_tidy <- result_tidy %>%
+  mutate(
+    sample_id = str_extract(Mixture, "(?<=TMS25H_)\\d+"),
+    patient_id = str_extract(Mixture, "(?<=Pt\\.)\\d+|(?<=gtc-)\\d+"),
+    treatment = str_extract(Mixture, "control|gsk"),
+    section = str_extract(Mixture, "(?<=_(control|gsk)_)[12]")
+  )
+
+# feature table:
+result <- result %>%
+  dplyr::select(-((ncol(.)-2):ncol(.)))
+
+library(tidyverse)
+
+# keep only numeric cell type proportions
+pca_input <- result %>%
+  column_to_rownames("Mixture")
+
+# PCA
+pca <- prcomp(
+  pca_input,
+  scale. = TRUE
+)
+
+# PCA scores
+pca_scores <- as.data.frame(pca$x)
+
+# plot
+library(ggplot2)
+
+ggplot(pca_scores, aes(PC1, PC2, label = rownames(pca_scores))) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.5, size = 3) +
+  theme_bw()
+
+
+# distance between samples
+dist_mat <- dist(scale(pca_input))
+
+# hierarchical clustering
+hc <- hclust(dist_mat, method = "ward.D2")
+
+# plot dendrogram
+plot(
+  hc,
+  main = "Hierarchical clustering of samples",
+  xlab = "",
+  sub = ""
+)
+
+library(ggplot2)
+
+result_tidy <- result_tidy %>%
+  mutate(identifier = paste0(treatment, "_", section))
+
+library(ggplot2)
+
+ggplot(result_tidy, aes(x = celltype, y = value)) +
+  geom_point(
+    aes(color = identifier),
+    position = position_jitter(width = 0.25, height = 0),
+    size = 3
+  ) +
+  facet_wrap(~ patient_id, ncol = 1) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    strip.text = element_text(size = 12)
+  ) +
+  labs(
+    color = "Sample",
+    x = "Cell type",
+    y = "Value"
+  )
+
+
+#Panel 2:
+
+library(ggplot2)
+
+ggplot(result_tidy, aes(x = patient_id, y = value)) +
+  geom_point(
+    aes(color = identifier),
+    position = position_jitter(width = 0.25, height = 0),
+    size = 3
+  ) +
+  facet_wrap(~ celltype, ncol = 3) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    strip.text = element_text(size = 12)
+  ) +
+  labs(
+    color = "Sample",
+    x = "Patient id",
+    y = "Value"
+  )
