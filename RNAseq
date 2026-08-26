@@ -1,0 +1,419 @@
+#RNA-seq analysis
+
+```{r include=FALSE}
+
+#set working directory
+setwd("/Users/enzhegalimova/Documents/ceritinib")
+```
+
+```{r include=FALSE}
+#Load the libraries
+# Analysis tools
+library(DESeq2)           # Fold change analysis
+library(apeglm)           # Method for shrinking fold changes
+
+# Data visualization
+library(tidyverse)        # Data munging and visualization (ggplot2)
+library(ggrepel)          # Improved labeling of plots
+library(pheatmap)         # Pretty Heatmaps
+library(EnhancedVolcano)  # Volcano plots
+library(RColorBrewer)     # Colour palettes
+
+# R markdown document formatting
+library(knitr)
+library(SummarizedExperiment)
+# Load necessary libraries
+library(dplyr)
+library(GenomicFeatures)
+library(rtracklayer)
+```
+```{r}
+sf_directory <- "C:\\Users\\egali049\\quant-files" #directory containing count files
+# List all .sf files in the directory
+sf_files <- list.files(path = sf_directory, pattern = "\\.sf$", full.names = TRUE)
+```
+
+```{r}
+sf_list <- list()
+
+# Process each .sf file
+for (file in sf_files) {
+  sample_name <- gsub(".sf$", "", basename(file))
+  
+  # Read the .sf file
+  sf_data <- read.delim(file, header = TRUE)
+  
+  # Keep only the relevant columns (NumReads for raw read counts)
+  sf_data <- sf_data %>%
+    dplyr::select(Name, NumReads) %>%
+    rename_with(~sample_name, .cols = "NumReads")
+  
+  # Add the data frame to the list
+  sf_list[[sample_name]] <- sf_data
+}
+
+
+# Merge all data frames by the 'Name' column
+data <- Reduce(function(x, y) merge(x, y, by = "Name", all = TRUE), sf_list)
+
+
+#file containing gene annotation, gownloaded from gencode
+gtf_file <- "C:\\Users\\egali049\\OneDrive - University of Ottawa\\ceritinib\\gencode.v47.primary_assembly.annotation.gtf.gz"
+
+# Import GTF file using rtracklayer
+gtf_data <- rtracklayer::import(gtf_file)
+gtf_df <- as.data.frame(gtf_data)
+
+# Filter gtf file for protein-coding genes
+coding_genes <- gtf_df %>%
+  filter(gene_type == "protein_coding") %>% 
+  pull(transcript_id)
+
+#  Filter the count matrix
+filtered_data <- data %>%
+  filter(Name %in% coding_genes)  
+
+#save the table:
+#write.table(filtered_data, "filtered_count_matrix_coding_genes.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+data <- filtered_data
+rm(filtered_data)
+```
+
+```{r}
+#transcrip id to gene id, then filter out lowly expressed gene counts
+# Create a transcript-to-gene mapping table
+transcript_to_gene <- gtf_df %>%
+  filter(!is.na(transcript_id)) %>% 
+  dplyr::select(transcript_id, gene_id)    # Keep only transcript_id and gene_id
+
+# Standardize transcript IDs by removing version numbers
+data$Name <- gsub("\\.\\d+$", "", data$Name)
+transcript_to_gene$transcript_id <- gsub("\\.\\d+$", "", transcript_to_gene$transcript_id)
+
+# Join data and transcript_to_gene
+mapped_counts <- data %>%
+  left_join(transcript_to_gene, by = c("Name" = "transcript_id"))
+
+# Aggregate counts at the gene level
+# Group by gene_id and sum counts across all transcripts
+gene_level_counts <- mapped_counts %>%
+  group_by(gene_id) %>%
+  summarise(across(-Name, sum, na.rm = TRUE))
+
+# Convert back to data frame
+gene_level_counts <- as.data.frame(gene_level_counts)
+rm(data)
+rm(mapped_counts)
+# Filter lowly expressed genes
+# Define a threshold for filtering (5 because it is commonly used, but on a more conservative side.)
+filtered_gene_counts <- gene_level_counts %>%
+  filter(rowSums(across(where(is.numeric))) >= 5)
+
+data <- filtered_gene_counts
+rm(filtered_gene_counts)
+rm(gene_level_counts)
+```
+
+```{r echo=FALSE}
+
+#Reformat for DESeq2 requirements
+
+#reformat as matrix
+data_mat<-as.matrix(data[,2:13])
+rownames(data_mat) <- data[[1]] 
+
+#load metadata
+meta<-read.table("C:\\Users\\egali049\\quant-files\\META-CERITINIB.csv",sep=",",header=T)
+rm(data) #remove from ram
+```
+
+## Create a deseq object
+```{r include=FALSE}
+
+#cleaning up the metadata
+data_mat <- round(data_mat)
+meta$Condition <- as.factor(meta$Condition)
+meta$Condition <- relevel(factor(meta$Condition), ref = "DMSO") #set DMSO as reference for all comparisons
+
+# Remove the last row, (named NA.), contains all reads that were not mapped to hugo, summed up
+data_mat <- data_mat[-nrow(data_mat), ]
+
+#deseq2 function
+dds <- DESeqDataSetFromMatrix(countData = data_mat, 
+                              colData = meta, 
+                              design = ~ Condition)
+# Run DESeq
+dds <- DESeq(dds)
+
+
+rm(data_mat)
+
+# Here I am creating a table for GSEA based on deseq2 results. Keeping ensembl versions after GSEA procedure, and adding hugo for readability/interpretability.
+
+normalized_counts <- counts(dds, normalized = TRUE)
+normalized_counts <- as.data.frame(normalized_counts)
+normalized_counts$gene_id <- rownames(normalized_counts)
+rownames(normalized_counts) <- NULL
+gtf_data <- as.data.frame(gtf_data)
+#Add gene names
+gene_mapping <- gtf_data %>%
+  filter(type == "gene") %>%  # Keep only rows corresponding to genes
+  dplyr::select(gene_id, gene_name) %>%  # Extract `gene_id` and `gene_name` columns
+  distinct()  # Ensure unique mappings
+# Remove version numbers from `Name` column in filtered_sf
+gene_mapping$gene_id <- gsub("\\.\\d+$", "", gene_mapping$gene_id)
+normalized_counts$gene_id <- gsub("\\.\\d+$", "", normalized_counts$gene_id)
+
+normalized_counts <- normalized_counts %>%
+  left_join(gene_mapping, by = "gene_id")
+#save the table
+write.table(normalized_counts,file="normalized_counts_CERITINIB-JAN14.txt",sep="\t",row.names=F,col.names=T,quote=F)
+```
+
+```{r}
+#This is optional to add the Condition to the normalized count tables
+
+# Create a mapping of Sample to Condition
+sample_condition_map <- setNames(as.character(meta$Condition), meta$Sample)
+
+# Rename the sample columns in normalized_counts based on the mapping
+# Exclude the `gene_id` and `gene_name` columns from renaming
+colnames(normalized_counts) <- ifelse(
+  colnames(normalized_counts) %in% names(sample_condition_map),
+  sample_condition_map[colnames(normalized_counts)],
+  colnames(normalized_counts)
+)
+
+# Check the result
+head(normalized_counts)
+
+```
+
+
+## RESULTS
+
+## Principal component analysis
+```{r echo=FALSE}
+#regularized log transformation
+rld<-rlog(dds)
+#PCA dimensions 1 and 2
+plotPCA(rld,intgroup="Condition") +     
+        geom_text_repel(aes(label=colData(dds)$Condition),size=3)  
+``` 
+
+## Hierarchical clustering plot
+```{r echo=FALSE}
+colours<-colorRampPalette(rev(brewer.pal(9,'Blues')))(255)
+sampleDists<-dist(t(assay(rld)))
+
+sdm<-as.matrix(sampleDists)
+rownames(sdm)<-colData(rld)$Sample_name
+colnames(sdm)<-colData(rld)$Sample_name
+
+pheatmap(sdm,color=colours,border_color=NA,legend=T)
+
+```
+
+
+## Gene dispersion estimates plot
+
+```{r echo=FALSE}
+    plotDispEsts(dds)
+```
+
+```{r include=FALSE}
+#view comparison names
+    resultsNames(dds)
+rm(vst)
+rm(rld)
+```
+
+
+## Differentially expressed genes between conditions
+```{r echo=FALSE}
+#emove results for ceritinib to a separate df
+res_CE <- results(dds, contrast = c("Condition", "CE", "DMSO"), alpha = 0.05)
+#perform LFC shrinkage
+res_CE <- lfcShrink(dds, coef = "Condition_CE_vs_DMSO", type = "apeglm")
+summary(res_CE)
+
+res_SU <- results(dds, contrast = c("Condition", "SU056", "DMSO"), alpha = 0.05)
+res_SU <- lfcShrink(dds, coef = "Condition_SU056_vs_DMSO", type = "apeglm")
+summary(res_SU)
+
+res_YB <- results(dds, contrast = c("Condition", "YB1", "DMSO"), alpha = 0.05)
+res_YB <- lfcShrink(dds, coef = "Condition_YB1_vs_DMSO", type = "apeglm")
+summary(res_YB)
+```
+
+
+```{r include=FALSE}
+#full DEG lists for different conditions
+df.out.ce<-as.data.frame(res_CE) %>% rownames_to_column("gene_id")
+df.out.yb<-as.data.frame(res_YB) %>% rownames_to_column("gene_id")
+df.out.su<-as.data.frame(res_SU) %>% rownames_to_column("gene_id")
+
+#order by decreasing padj
+df.out.ce <- df.out.ce[order(df.out.ce$padj, decreasing = FALSE), ]
+df.out.yb <- df.out.yb[order(df.out.yb$padj, decreasing = FALSE), ]
+df.out.su <- df.out.su[order(df.out.su$padj, decreasing = FALSE), ]
+
+#Add gene names
+gene_mapping <- gtf_df %>%
+  filter(type == "gene") %>%  # Keep only rows corresponding to genes
+  dplyr::select(gene_id, gene_name) %>%  # Extract `gene_id` and `gene_name` columns
+  distinct()  # Ensure unique mappings
+
+# Remove version numbers from `Name` column in filtered_sf
+gene_mapping$gene_id <- gsub("\\.\\d+$", "", gene_mapping$gene_id)
+# Remove version numbers from `Name` column in filtered_sf
+df.out.ce$gene_id <- gsub("\\.\\d+$", "", df.out.ce$gene_id)
+# Remove version numbers from `Name` column in filtered_sf
+df.out.yb$gene_id <- gsub("\\.\\d+$", "", df.out.yb$gene_id)
+# Remove version numbers from `Name` column in filtered_sf
+df.out.su$gene_id <- gsub("\\.\\d+$", "", df.out.su$gene_id)
+
+#merge by gene_id
+df.out.ce <- df.out.ce %>%
+  left_join(gene_mapping, by = "gene_id")
+
+df.out.yb <- df.out.yb %>%
+  left_join(gene_mapping, by = "gene_id")
+
+df.out.su <- df.out.su %>%
+  left_join(gene_mapping, by = "gene_id")
+
+#significant DEGs to a separate df
+df.out.ce.sig <- df.out.ce[which(df.out.ce$padj<0.05),]
+df.out.yb.sig <- df.out.yb[which(df.out.yb$padj<0.05),]
+df.out.su.sig <- df.out.su[which(df.out.su$padj<0.05),]
+
+#export sig DEGs
+write.table(df.out.ce.sig,file="ceritinib_sig_genes-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+write.table(df.out.su.sig,file="SU056_sig_genes-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+write.table(df.out.yb.sig,file="YB1_sig_genes-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+
+#export all genes
+write.table(df.out.ce,file="ceritinib_all_genes-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+write.table(df.out.su,file="SU056_all_genes-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+write.table(df.out.yb,file="YB1_all_genes-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+
+#find common DEGs, not checked for consistent modulation!
+common_ce_yb <- intersect(df.out.ce.sig$gene_name, df.out.yb.sig$gene_name)
+common_ce_su <- intersect(df.out.ce.sig$gene_name, df.out.su.sig$gene_name)
+common_yb_su <- intersect(df.out.yb.sig$gene_name, df.out.su.sig$gene_name)
+
+#export common DEGs
+write.table(common_ce_yb,file="common_DEG_ceritinib&YB1-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+write.table(common_ce_su,file="common_DEG_ceritinib&SU056-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+write.table(common_yb_su,file="common_DEG_SU056&YB1-dec18.txt",sep="\t",row.names=F,col.names=T,quote=F)
+```
+
+```{r}
+#Volcano plots
+library(EnhancedVolcano)
+
+# Volcano plot for DMSO vs. Ceritinib
+volcano1 <- EnhancedVolcano(
+  df.out.ce,
+  lab = df.out.ce$gene_name, #add gene labels
+  labSize = 3,
+  x = "log2FoldChange",
+  y = "pvalue",
+  title = "Ceritinib vs. DMSO",
+  pCutoff = 50e-3,        # p-value cutoff
+  FCcutoff = 1,         # Log2 fold change cutoff
+  legendPosition = "right",
+  subtitle = "",
+  axisLabSize = 10
+)
+
+# Volcano plot for DMSO vs. YB1
+volcano2 <- EnhancedVolcano(
+  df.out.yb,
+  lab = df.out.yb$gene_name,
+  labSize = 3,
+  x = "log2FoldChange",
+  y = "pvalue",
+  title = "YB1 vs. DMSO",
+  pCutoff = 50e-3,       
+  FCcutoff = 1,    
+  legendPosition = "right",
+  subtitle = "",
+  axisLabSize = 10
+)
+
+
+# Volcano plot for DMSO vs. SU056
+volcano3 <- EnhancedVolcano(
+  df.out.su,
+  lab = df.out.su$gene_name,
+  labSize = 3,
+  x = "log2FoldChange",
+  y = "pvalue",
+  title = "SU056 vs. DMSO",
+  pCutoff = 50e-3,      
+  FCcutoff = 1,       
+  legendPosition = "right",
+  subtitle = "",
+  axisLabSize = 10
+)
+
+volcano1
+volcano2
+volcano3
+
+# Save the plots as PDF
+ggsave(filename = "volcano_ceritinib_ce_Jan15.pdf", plot = volcano1, width = 8, height = 6)
+ggsave(filename = "volcano_ceritinib_yb_Jan15.pdf", plot = volcano2, width = 8, height = 6)
+ggsave(filename = "volcano_ceritinib_su_Jan15.pdf", plot = volcano3, width = 8, height = 6)
+```
+
+
+
+```{r}
+#Genes that are common to all, with consistent modulation!
+
+#Find common genes across all three lists
+common_genes <- Reduce(intersect, list(df.out.ce.sig$gene_id, df.out.yb.sig$gene_id, df.out.su.sig$gene_id))
+
+#Filter for common genes in each dataset
+common_ce <- df.out.ce.sig %>% filter(gene_id %in% common_genes)
+common_yb <- df.out.yb.sig %>% filter(gene_id %in% common_genes)
+common_su <- df.out.su.sig %>% filter(gene_id %in% common_genes)
+
+#Merge the filtered datasets for comparison
+merged_common <- common_ce %>%
+  dplyr::select(gene_id,gene_name, log2FoldChange_ce = log2FoldChange) %>%
+  left_join(
+    common_yb %>% dplyr::select(gene_id, log2FoldChange_yb = log2FoldChange),
+    by = "gene_id"
+  ) %>%
+  left_join(
+    common_su %>% dplyr::select(gene_id, log2FoldChange_su = log2FoldChange),
+    by = "gene_id"
+  )
+
+# Filter for consistent modulation direction (same LFC sign)
+# Ensure all LFCs are positive or all negative
+consistent_genes <- merged_common %>%
+  filter(
+    (log2FoldChange_ce > 0 & log2FoldChange_yb > 0 & log2FoldChange_su > 0) |
+    (log2FoldChange_ce < 0 & log2FoldChange_yb < 0 & log2FoldChange_su < 0)
+  )
+
+# Save the consistent genes
+write.table(
+  consistent_genes,
+  file = "consistent_modulated_genes_dec18.txt",
+  sep = "\t",
+  row.names = FALSE,
+  col.names = TRUE,
+  quote = FALSE
+)
+
+#View the final list
+head(consistent_genes)
+
+```
